@@ -1,87 +1,123 @@
-import express from "express";
+// server.mjs
+import http from "http";
+import { URL } from "url";
+import ffmpeg from "fluent-ffmpeg";
 import fetch from "node-fetch";
-import ffmpegPath from "ffmpeg-static";
-import { promises as fs } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
-import { randomUUID } from "crypto";
-import { spawn } from "child_process";
-
-const app = express();
-app.use(express.json({ limit: "10mb" }));
-
-function log(...xs) {
-  console.log("[mux-service]", ...xs);
-}
-
-app.post("/mux", async (req, res) => {
-  try {
-    const { videoUrl, audioUrl } = req.body || {};
-    if (!videoUrl || !audioUrl) {
-      return res.status(400).json({ error: "Missing videoUrl or audioUrl" });
-    }
-
-    log("MUX request", { videoUrl, audioUrl });
-
-    const id = randomUUID();
-    const dir = tmpdir();
-    const videoPath = join(dir, `${id}-video.mp4`);
-    const audioPath = join(dir, `${id}-audio.mp3`);
-    const outPath = join(dir, `${id}-out.mp4`);
-
-    async function downloadToFile(url, destPath) {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`Download failed: ${url} (${r.status})`);
-      const buf = Buffer.from(await r.arrayBuffer());
-      await fs.writeFile(destPath, buf);
-    }
-
-    await downloadToFile(videoUrl, videoPath);
-    await downloadToFile(audioUrl, audioPath);
-
-    await new Promise((resolve, reject) => {
-      const args = [
-        "-i",
-        videoPath,
-        "-i",
-        audioPath,
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        "-y",
-        outPath,
-      ];
-
-      log("Running ffmpeg", ffmpegPath, args.join(" "));
-
-      const proc = spawn(ffmpegPath, args);
-
-      proc.stderr.on("data", d => log(String(d)));
-      proc.on("error", reject);
-      proc.on("close", code => {
-        if (code === 0) resolve();
-        else reject(new Error("ffmpeg exited with code " + code));
-      });
-    });
-
-    const outBuf = await fs.readFile(outPath);
-
-    // cleanup (best effort)
-    fs.unlink(videoPath).catch(() => {});
-    fs.unlink(audioPath).catch(() => {});
-    fs.unlink(outPath).catch(() => {});
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.send(outBuf);
-  } catch (err) {
-    log("MUX error", err);
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  log("Listening on port", PORT);
+
+function log(...args) {
+  console.log("[mux-service]", ...args);
+}
+
+// download helper → Buffer
+async function fetchBuffer(url) {
+  log("Downloading", url);
+  const res = await fetch(url);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Failed to download: ${res.status} ${txt}`);
+  }
+  const arrayBuf = await res.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+// very simple in-memory mux
+function muxAudioVideo(videoBuf, audioBuf) {
+  return new Promise((resolve, reject) => {
+    const { PassThrough } = require("stream");
+
+    const vStream = new PassThrough();
+    const aStream = new PassThrough();
+
+    vStream.end(videoBuf);
+    aStream.end(audioBuf);
+
+    const outStream = new PassThrough();
+    const chunks = [];
+
+    outStream.on("data", (c) => chunks.push(c));
+    outStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outStream.on("error", reject);
+
+    ffmpeg()
+      .input(vStream)
+      .input(aStream)
+      .outputOptions(["-c:v copy", "-c:a aac"])
+      .format("mp4")
+      .on("error", (err) => reject(err))
+      .pipe(outStream);
+  });
+}
+
+// upload result somewhere (for now we just return base64 URL)
+// You can later swap this to Supabase storage if you want.
+async function handleMux(videoUrl, audioUrl, res) {
+  try {
+    log("Start mux", { videoUrl, audioUrl });
+
+    const [vBuf, aBuf] = await Promise.all([
+      fetchBuffer(videoUrl),
+      fetchBuffer(audioUrl),
+    ]);
+
+    const muxed = await muxAudioVideo(vBuf, aBuf);
+
+    // TEMP: data URL return (supabase upload would be better)
+    const b64 = muxed.toString("base64");
+    const dataUrl = `data:video/mp4;base64,${b64}`;
+
+    const body = JSON.stringify({ muxedUrl: dataUrl });
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    res.end(body);
+  } catch (err) {
+    log("Mux error", err);
+    const body = JSON.stringify({ error: err.message || String(err) });
+    res.writeHead(500, {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    res.end(body);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://localhost");
+
+  // health
+  if (req.method === "GET" && url.pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+
+  // accept POST on *both* "/" and "/mux" so we can't mismatch
+  if (req.method === "POST" && (url.pathname === "/" || url.pathname === "/mux")) {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const parsed = JSON.parse(body || "{}");
+        const { videoUrl, audioUrl } = parsed;
+        if (!videoUrl || !audioUrl) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Missing videoUrl or audioUrl" }));
+        }
+        handleMux(videoUrl, audioUrl, res);
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad JSON" }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not found");
+});
+
+server.listen(PORT, () => {
+  log(`Listening on port ${PORT}`);
 });
