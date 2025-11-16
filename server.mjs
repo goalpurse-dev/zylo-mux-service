@@ -3,7 +3,8 @@ import http from "http";
 import { URL } from "url";
 import ffmpeg from "fluent-ffmpeg";
 import fetch from "node-fetch";
-import { PassThrough } from "stream";
+import { promises as fs } from "fs";
+import { randomBytes } from "crypto";
 
 const PORT = process.env.PORT || 3000;
 
@@ -11,7 +12,9 @@ function log(...args) {
   console.log("[mux-service]", ...args);
 }
 
-// download helper → Buffer
+// -------------------------
+// Download helper → Buffer
+// -------------------------
 async function fetchBuffer(url) {
   log("Downloading", url);
   const res = await fetch(url);
@@ -23,34 +26,44 @@ async function fetchBuffer(url) {
   return Buffer.from(arrayBuf);
 }
 
-function muxAudioVideo(videoBuf, audioBuf) {
-  return new Promise((resolve, reject) => {
-    // PassThrough already imported from "stream" at the top
-    const vStream = new PassThrough();
-    const aStream = new PassThrough();
+// -------------------------
+// ffmpeg mux using temp files
+// -------------------------
+async function muxAudioVideo(videoBuf, audioBuf) {
+  // unique id for temp files
+  const id = randomBytes(8).toString("hex");
+  const tmpVideo = `/tmp/video-${id}.mp4`;
+  const tmpAudio = `/tmp/audio-${id}.mp3`;
+  const tmpOut   = `/tmp/out-${id}.mp4`;
 
-    vStream.end(videoBuf);
-    aStream.end(audioBuf);
+  // write inputs to disk
+  await fs.writeFile(tmpVideo, videoBuf);
+  await fs.writeFile(tmpAudio, audioBuf);
 
-    const outStream = new PassThrough();
-    const chunks = [];
-
-    outStream.on("data", (c) => chunks.push(c));
-    outStream.on("end", () => resolve(Buffer.concat(chunks)));
-    outStream.on("error", reject);
-
-    ffmpeg()
-      .input(vStream)
-      .input(aStream)
-      .outputOptions(["-c:v copy", "-c:a aac"])
-      .format("mp4")
-      .on("error", (err) => reject(err))
-      .pipe(outStream);
+  // run ffmpeg: copy video stream, re-encode audio, stop at shortest
+  await new Promise((resolve, reject) => {
+    ffmpeg(tmpVideo)
+      .input(tmpAudio)
+      .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
+      .save(tmpOut)
+      .on("end", resolve)
+      .on("error", reject);
   });
+
+  // read output back to memory
+  const outBuf = await fs.readFile(tmpOut);
+
+  // best-effort cleanup (non-blocking)
+  fs.unlink(tmpVideo).catch(() => {});
+  fs.unlink(tmpAudio).catch(() => {});
+  fs.unlink(tmpOut).catch(() => {});
+
+  return outBuf;
 }
 
-// upload result somewhere (for now we just return base64 URL)
-// You can later swap this to Supabase storage if you want.
+// -------------------------
+// HTTP handler for /mux
+// -------------------------
 async function handleMux(videoUrl, audioUrl, res) {
   try {
     log("Start mux", { videoUrl, audioUrl });
@@ -62,7 +75,7 @@ async function handleMux(videoUrl, audioUrl, res) {
 
     const muxed = await muxAudioVideo(vBuf, aBuf);
 
-    // TEMP: data URL return (supabase upload would be better)
+    // TEMP: data URL return (later you can upload to Supabase instead)
     const b64 = muxed.toString("base64");
     const dataUrl = `data:video/mp4;base64,${b64}`;
 
@@ -83,16 +96,19 @@ async function handleMux(videoUrl, audioUrl, res) {
   }
 }
 
+// -------------------------
+// HTTP server
+// -------------------------
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
 
-  // health
+  // health check
   if (req.method === "GET" && url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     return res.end("ok");
   }
 
-  // accept POST on *both* "/" and "/mux" so we can't mismatch
+  // accept POST on *both* "/" and "/mux"
   if (req.method === "POST" && (url.pathname === "/" || url.pathname === "/mux")) {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
