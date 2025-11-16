@@ -3,6 +3,7 @@ import http from "http";
 import { URL } from "url";
 import ffmpeg from "fluent-ffmpeg";
 import fetch from "node-fetch";
+import { PassThrough } from "stream";
 
 const PORT = process.env.PORT || 3000;
 
@@ -22,11 +23,9 @@ async function fetchBuffer(url) {
   return Buffer.from(arrayBuf);
 }
 
-// very simple in-memory mux
 function muxAudioVideo(videoBuf, audioBuf) {
   return new Promise((resolve, reject) => {
-    const { PassThrough } = require("stream");
-
+    // PassThrough already imported from "stream" at the top
     const vStream = new PassThrough();
     const aStream = new PassThrough();
 
